@@ -292,6 +292,57 @@ def home():
         "note": "Using NLTK VADER for sentiment analysis (lighter, faster)"
     })
 
+def generate_report(ranked_complaints):
+    """
+    Generate an executive summary report from the ranked complaints.
+    Format: Bullet points with actionable insights.
+    """
+    if not ranked_complaints or len(ranked_complaints) == 0:
+        return "No significant issues detected in social listening tools during this period."
+    
+    report_lines = ["Social Listening Tools - Issues Report:", ""]
+    
+    # Top 5 issues
+    top_issues = ranked_complaints[:5]
+    
+    for i, complaint in enumerate(top_issues, 1):
+        category = complaint['complaint']['category']
+        keywords = complaint['complaint']['subcategories'][:3]
+        mentions = complaint['metrics']['mentions']
+        severity = complaint['metrics']['severity']
+        influence = complaint['metrics']['influence']
+        
+        # Create descriptive keywords
+        keywords_str = ', '.join(keywords)
+        
+        # Action verbs based on severity
+        if severity > 0.6:
+            action = "URGENT - Address"
+        elif severity > 0.4:
+            action = "Monitor"
+        elif severity > 0.2:
+            action = "Track"
+        else:
+            action = "Observe"
+        
+        # Format bullet point
+        bullet = f"- {action} {category} concerns around {keywords_str} ({mentions} mentions, severity: {severity:.2f}, influence: {influence:.2f})"
+        report_lines.append(bullet)
+    
+    # Add summary line
+    total_mentions = sum(c['metrics']['mentions'] for c in ranked_complaints)
+    avg_severity = sum(c['metrics']['severity'] for c in ranked_complaints) / len(ranked_complaints)
+    
+    report_lines.append("")
+    report_lines.append(f"Summary: Analyzed {total_mentions} total mentions across {len(ranked_complaints)} issue categories. Average severity: {avg_severity:.2f}")
+    
+    if top_issues[0]['metrics']['severity'] > 0.5:
+        report_lines.append("Recommendation: Prioritize addressing the top 3 issues which show high user frustration.")
+    else:
+        report_lines.append("Recommendation: Continue monitoring trends; no critical issues requiring immediate action.")
+    
+    return "\n".join(report_lines)
+
 @app.route('/health')
 def health():
     return jsonify({"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()})
@@ -339,9 +390,13 @@ def analyze():
                 ]
             })
         
+        # Generate executive report
+        report = generate_report(ranked_complaints)
+        
         response = {
             "data": {
-                "ranked_complaints": ranked_complaints
+                "ranked_complaints": ranked_complaints,
+                "report": report
             },
             "meta": {
                 "total": len(ranked_complaints),
