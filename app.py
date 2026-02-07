@@ -1,290 +1,352 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import os
-import time
-from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any
-import pandas as pd
 import praw
+import pandas as pd
+import numpy as np
+from datetime import datetime, timezone
+from transformers import pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import KMeans
 import re
-from collections import Counter
+import os
+import warnings
+warnings.filterwarnings('ignore')
 
 app = Flask(__name__)
 CORS(app)
 
 REDDIT_CLIENT_ID = os.getenv('REDDIT_CLIENT_ID', 'PH99oWZjM43GimMtYigFvA')
 REDDIT_CLIENT_SECRET = os.getenv('REDDIT_CLIENT_SECRET', '3tJsXQKEtFFYInxzLEDqRZ0s_w5z0g')
-REDDIT_USER_AGENT = os.getenv('REDDIT_USER_AGENT', 'ow_part1_box1_script')
-
-nlp = None
-
-def get_nlp():
-    global nlp
-    if nlp is None:
-        import spacy
-        print("Loading spaCy model...")
-        nlp = spacy.load("en_core_web_sm")
-        print("spaCy model loaded")
-    return nlp
 
 print("Connecting to Reddit...")
 reddit = praw.Reddit(
     client_id=REDDIT_CLIENT_ID,
     client_secret=REDDIT_CLIENT_SECRET,
-    user_agent=REDDIT_USER_AGENT,
+    user_agent='Sentivity_Overwatch_Feature4_API',
     check_for_async=False
 )
 print("Reddit client ready")
 
-MKT_SEO_SL_SUBS: List[str] = [
-    "marketing",
-    "SEO",
-    "digital_marketing",
-    "socialmedia",
-    "PPC",
-]
+sentiment_analyzer = None
 
-bad_org = {
-    "Reddit", "YouTube", "Instagram", "TikTok",
-    "GOP", "Democrats", "Republicans",
-}
+def get_sentiment_analyzer():
+    global sentiment_analyzer
+    if sentiment_analyzer is None:
+        print("Loading sentiment analyzer...")
+        sentiment_analyzer = pipeline(
+            "sentiment-analysis",
+            model="distilbert-base-uncased-finetuned-sst-2-english"
+        )
+        print("Sentiment analyzer loaded")
+    return sentiment_analyzer
 
+SUBREDDITS = ['marketing', 'SEO', 'digital_marketing', 'socialmedia', 'PPC', 'analytics']
+SEARCH_TERMS = ['social listening', 'Brandwatch', 'Brand24', 'Hootsuite', 'Sprout Social', 'customer voice', 'social media monitoring']
 
-def fetch_hot_posts(
-    subreddits: List[str],
-    days: int = 7,
-    per_sub_limit: int = 200,
-    sleep_seconds: float = 0.0,
-) -> pd.DataFrame:
+def clean_text(text):
+    text = str(text).lower()
+    text = re.sub(r'http\S+', '', text)
+    text = re.sub(r'[^a-zA-Z\s]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def reddit_influence(row):
+    """
+    Standardized influence algorithm from example script.
+    Uses logarithmic scaling to prevent outliers from dominating.
+    """
+    score = max(row.get('score', 0) or 0, 0)
+    comments = max(row.get('num_comments', 0) or 0, 0)
+    return np.log1p(score) + 0.5 * np.log1p(comments)
+
+def collect_reddit_posts(subreddits, search_terms, time_filter='week', limit=20):
+    """
+    Collect Reddit posts - searches r/all first, then specific subreddits.
+    Uses 'relevance' sorting for best quality results.
+    """
+    all_posts = []
     
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    rows: List[Dict[str, Any]] = []
-
-    for sub in subreddits:
+    # STEP 1: Search r/all first
+    for term in search_terms:
         try:
-            subreddit = reddit.subreddit(sub)
-
-            for post in subreddit.hot(limit=per_sub_limit):
-                created = datetime.fromtimestamp(post.created_utc, tz=timezone.utc)
-
-                if created < cutoff:
-                    break
-
-                rows.append({
-                    "subreddit": sub,
-                    "post_id": post.id,
-                    "created_utc": post.created_utc,
-                    "created_dt": created.isoformat(),
-                    "title": (post.title or "").strip(),
-                    "selftext": (post.selftext or "").strip(),
-                    "url": getattr(post, "url", ""),
-                    "permalink": f"https://www.reddit.com{getattr(post, 'permalink', '')}",
-                    "score": getattr(post, "score", None),
-                    "num_comments": getattr(post, "num_comments", None),
-                    "author": str(getattr(post, "author", "")) if getattr(post, "author", None) else None,
-                    "is_self": getattr(post, "is_self", None),
-                    "over_18": getattr(post, "over_18", None),
+            print(f"  Searching r/all for '{term}'...", end=' ')
+            sub = reddit.subreddit('all')
+            posts = sub.search(term, sort='relevance', time_filter=time_filter, limit=limit)
+            
+            count = 0
+            for post in posts:
+                post.comments.replace_more(limit=0)
+                comments = [c.body for c in post.comments.list()[:5]]
+                
+                all_posts.append({
+                    'id': post.id,
+                    'title': post.title,
+                    'text': post.selftext,
+                    'score': post.score,
+                    'num_comments': post.num_comments,
+                    'created_utc': datetime.fromtimestamp(post.created_utc, tz=timezone.utc),
+                    'url': post.url,
+                    'source': 'r/all',
+                    'top_comments': ' '.join(comments)
                 })
-
-                if sleep_seconds:
-                    time.sleep(sleep_seconds)
-
+                count += 1
+            print(f'Found {count} posts')
         except Exception as e:
-            print(f"[WARN] Subreddit '{sub}' failed: {e}")
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    df["full_text"] = (
-        df["title"].astype(str).str.strip()
-        + "\n"
-        + df["selftext"].astype(str).str.strip()
-    ).str.strip()
-
-    df = df.drop_duplicates(subset=["post_id"]).reset_index(drop=True)
-    df = df.sort_values("created_utc", ascending=False).reset_index(drop=True)
-
+            print(f'Error: {e}')
+    
+    # STEP 2: Search specific subreddits
+    for subreddit_name in subreddits:
+        subreddit = reddit.subreddit(subreddit_name)
+        
+        for term in search_terms:
+            try:
+                print(f"  Searching r/{subreddit_name} for '{term}'...", end=' ')
+                posts = subreddit.search(term, sort='relevance', time_filter=time_filter, limit=limit)
+                
+                count = 0
+                for post in posts:
+                    post.comments.replace_more(limit=0)
+                    comments = [c.body for c in post.comments.list()[:5]]
+                    
+                    all_posts.append({
+                        'id': post.id,
+                        'title': post.title,
+                        'text': post.selftext,
+                        'score': post.score,
+                        'num_comments': post.num_comments,
+                        'created_utc': datetime.fromtimestamp(post.created_utc, tz=timezone.utc),
+                        'url': post.url,
+                        'source': f'r/{subreddit_name}',
+                        'top_comments': ' '.join(comments)
+                    })
+                    count += 1
+                print(f'Found {count} posts')
+            except Exception as e:
+                print(f'Error: {e}')
+                continue
+    
+    df = pd.DataFrame(all_posts)
+    
+    # Deduplicate by post ID
+    if len(df) > 0:
+        initial_count = len(df)
+        df = df.drop_duplicates(subset=['id'])
+        final_count = len(df)
+        print(f'Total: {initial_count}, After dedup: {final_count}, Removed: {initial_count - final_count}')
+    
     return df
 
+def get_negativity_score(text, analyzer):
+    try:
+        text = text[:512]
+        result = analyzer(text)[0]
+        
+        if result['label'] == 'NEGATIVE':
+            return result['score']
+        else:
+            return 1 - result['score']
+    except:
+        return 0.5
 
-def extract_orgs(text: str) -> List[str]:
+def get_cluster_keywords(posts_df, vectorizer, cluster_id, n_keywords=5):
+    cluster_posts = posts_df[posts_df['cluster'] == cluster_id]
+    cluster_tfidf = vectorizer.transform(cluster_posts['cleaned_content'])
     
-    if not isinstance(text, str) or not text.strip():
-        return []
-
-    nlp = get_nlp()
-    doc = nlp(text[:5000])
-    orgs: List[str] = []
-
-    for ent in doc.ents:
-        if ent.label_ == "ORG":
-            name = ent.text.strip()
-            name = re.sub(r"\s+", " ", name)
-            name = name.strip(".,:;()[]{}\"'")
-
-            if len(name) < 2:
-                continue
-            if name in bad_org:
-                continue
-            if name.isupper() and len(name) <= 3:
-                continue
-
-            orgs.append(name)
+    feature_names = vectorizer.get_feature_names_out()
+    scores = cluster_tfidf.sum(axis=0).A1
     
-    return orgs
+    top_indices = scores.argsort()[-n_keywords:][::-1]
+    return [feature_names[i] for i in top_indices]
 
-
-def collapse_to_parent(org: str, org_set: set) -> str:
+def categorize_cluster(keywords_list):
+    keywords_text = ' '.join(keywords_list).lower()
     
-    s = re.sub(r"\s+", " ", org).strip().strip(".,:;()[]{}\"'")
-    s_cf = s.casefold()
-    parts = s.split()
-
-    if len(parts) == 1:
-        return s_cf
-
-    for k in range(len(parts), 0, -1):
-        prefix = " ".join(parts[:k]).casefold()
-        if prefix in org_set:
-            return prefix
-
-    return parts[0].casefold()
-
-
-def analyze_companies(days: int = 7, per_sub_limit: int = 200):
+    seo_words = ['seo', 'search', 'ranking', 'google', 'keyword', 'optimization']
+    geo_words = ['location', 'local', 'geo', 'geographic', 'region', 'area']
+    sl_words = ['listening', 'monitoring', 'tracking', 'social', 'brand', 'mention']
+    cv_words = ['customer', 'voice', 'feedback', 'review', 'sentiment', 'opinion']
     
-    df_mkt = fetch_hot_posts(
-        MKT_SEO_SL_SUBS, 
-        days=days, 
-        per_sub_limit=per_sub_limit, 
-        sleep_seconds=0.0
+    categories = []
+    if any(word in keywords_text for word in seo_words):
+        categories.append('SEO')
+    if any(word in keywords_text for word in geo_words):
+        categories.append('GEO')
+    if any(word in keywords_text for word in sl_words):
+        categories.append('Social Listening')
+    if any(word in keywords_text for word in cv_words):
+        categories.append('Customer Voice')
+    
+    return categories or ['General Marketing']
+
+def analyze_issues(time_filter='week', limit=15, num_clusters=8):
+    """
+    Main analysis pipeline - updated with influence algorithm.
+    """
+    print(f"Starting analysis (time_filter={time_filter}, limit={limit})")
+    
+    posts_df = collect_reddit_posts(SUBREDDITS, SEARCH_TERMS, time_filter, limit)
+    
+    if len(posts_df) == 0:
+        return {"error": "No posts collected"}
+    
+    print(f"Collected {len(posts_df)} posts")
+    
+    posts_df['full_content'] = (
+        posts_df['title'] + ' ' +
+        posts_df['text'] + ' ' +
+        posts_df['top_comments']
     )
-    df_mkt["bucket"] = "marketing"
-
-    if df_mkt.empty:
-        return {
-            "error": "No posts collected",
-            "message": "Try increasing per_sub_limit or add more subreddits"
-        }
-
-    df_mkt["orgs"] = df_mkt["full_text"].apply(extract_orgs)
-
-    exploded = df_mkt.explode("orgs").dropna(subset=["orgs"]).copy()
-
-    if exploded.empty:
-        return {
-            "error": "No organizations found",
-            "message": "No ORG entities found. Try increasing PER_SUB_LIMIT."
-        }
-
-    exploded["org_clean"] = (
-        exploded["orgs"].astype(str)
-        .str.replace(r"\s+", " ", regex=True)
-        .str.strip()
-        .str.strip(".,:;()[]{}\"'")
+    
+    posts_df['cleaned_content'] = posts_df['full_content'].apply(clean_text)
+    posts_df = posts_df[posts_df['cleaned_content'].str.len() > 50]
+    
+    if len(posts_df) < num_clusters:
+        num_clusters = max(3, len(posts_df) // 2)
+    
+    # Calculate influence scores BEFORE clustering
+    posts_df['influence'] = posts_df.apply(reddit_influence, axis=1)
+    
+    vectorizer = TfidfVectorizer(
+        max_features=500,
+        min_df=2,
+        max_df=0.8,
+        stop_words='english',
+        ngram_range=(1, 2)
     )
-
-    org_set = set(exploded["org_clean"].str.casefold().tolist())
-
-    exploded["company_key"] = exploded["org_clean"].apply(
-        lambda org: collapse_to_parent(org, org_set)
+    
+    tfidf_matrix = vectorizer.fit_transform(posts_df['cleaned_content'])
+    
+    kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
+    posts_df['cluster'] = kmeans.fit_predict(tfidf_matrix)
+    
+    print("Analyzing sentiment...")
+    analyzer = get_sentiment_analyzer()
+    posts_df['negativity_score'] = posts_df['cleaned_content'].apply(
+        lambda x: get_negativity_score(x, analyzer)
     )
-
-    display_map = (
-        exploded.assign(company_key=exploded["company_key"])
-        .groupby(["company_key", "org_clean"])
-        .size()
-        .reset_index(name="n")
-        .sort_values(["company_key", "n"], ascending=[True, False])
-        .drop_duplicates("company_key")
-        .set_index("company_key")["org_clean"]
-        .to_dict()
-    )
-
-    counts = exploded.groupby("company_key").size().sort_values(ascending=False)
-
-    top10 = counts.head(10).reset_index()
-    top10.columns = ["company_key", "mentions"]
-    top10["company"] = top10["company_key"].map(display_map).fillna(top10["company_key"])
-    top10 = top10[["company", "mentions"]]
-
-    return top10
-
+    
+    ranked_issues = []
+    
+    for cluster_id in range(num_clusters):
+        cluster_posts = posts_df[posts_df['cluster'] == cluster_id]
+        
+        if len(cluster_posts) == 0:
+            continue
+        
+        keywords = get_cluster_keywords(posts_df, vectorizer, cluster_id)
+        categories = categorize_cluster(keywords)
+        
+        avg_negativity = cluster_posts['negativity_score'].mean()
+        frequency = len(cluster_posts)
+        avg_influence = cluster_posts['influence'].mean()
+        
+        # KEY CHANGE: Use influence-weighted scoring
+        final_score = avg_negativity * frequency * (1 + avg_influence/10)
+        
+        # Sort by influence, not just score
+        top_posts = cluster_posts.nlargest(3, 'influence')
+        sample_posts = []
+        for _, post in top_posts.iterrows():
+            sample_posts.append({
+                "title": post['title'],
+                "url": post['url'],
+                "score": int(post['score']),
+                "comments": int(post['num_comments']),
+                "influence": round(float(post['influence']), 2)
+            })
+        
+        ranked_issues.append({
+            'cluster_id': cluster_id,
+            'categories': categories,
+            'keywords': keywords,
+            'frequency': frequency,
+            'avg_negativity': round(avg_negativity, 3),
+            'avg_influence': round(avg_influence, 2),
+            'final_score': round(final_score, 2),
+            'sample_posts': sample_posts
+        })
+    
+    ranked_issues = sorted(ranked_issues, key=lambda x: x['final_score'], reverse=True)
+    
+    for i, issue in enumerate(ranked_issues, 1):
+        issue['rank'] = i
+    
+    print(f"Analysis complete. Found {len(ranked_issues)} issues")
+    
+    return ranked_issues
 
 @app.route('/')
 def home():
     return jsonify({
         "status": "running",
-        "service": "Feature 1 - Companies Needing Social Listening",
+        "service": "Feature 4 - SEO/GEO/Social Listening Issues",
         "endpoints": {
-            "/": "Health check",
-            "/analyze": "Run analysis (GET)",
-            "/health": "Service health"
+            "/": "API info",
+            "/health": "Health check",
+            "/analyze": "Run issue analysis"
         }
     })
-
 
 @app.route('/health')
 def health():
     return jsonify({"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()})
 
-
-@app.route('/test', methods=['GET'])
-def test():
-    return jsonify({
-        "status": "working",
-        "message": "API is functioning correctly",
-        "endpoints": {
-            "/": "API info",
-            "/health": "Health check", 
-            "/test": "Quick test (this endpoint)",
-            "/analyze": "Run analysis (takes 2-5 minutes)",
-            "/analyze?limit=20": "Fast analysis with fewer posts"
-        },
-        "tip": "Use /analyze?limit=20 for faster results on free tier"
-    })
-
-
 @app.route('/analyze', methods=['GET'])
 def analyze():
     try:
-        days = int(request.args.get('days', 7))
-        limit = int(request.args.get('limit', 50))
+        time_filter = request.args.get('time_filter', 'week')
+        limit = int(request.args.get('limit', 15))
         
-        print(f"Starting analysis (days={days}, limit={limit})")
+        print(f"Starting analysis (time_filter={time_filter}, limit={limit})")
         
-        result = analyze_companies(days=days, per_sub_limit=limit)
+        result = analyze_issues(time_filter, limit)
         
         if isinstance(result, dict) and "error" in result:
             return jsonify(result), 400
         
-        ranked_companies = []
-        for idx, row in result.iterrows():
-            ranked_companies.append({
-                "rank": int(idx + 1),
-                "company": {
-                    "id": f"cmp_{row['company'].lower().replace(' ', '_')}",
-                    "name": row['company']
+        ranked_complaints = []
+        for issue in result:
+            ranked_complaints.append({
+                "rank": issue['rank'],
+                "complaint": {
+                    "id": f"issue_{issue['cluster_id']}",
+                    "title": ' + '.join(issue['keywords'][:3]),
+                    "category": issue['categories'][0] if issue['categories'] else 'General',
+                    "subcategories": issue['keywords']
                 },
-                "volume": {
-                    "mentions": int(row['mentions'])
-                }
+                "metrics": {
+                    "frequency": round(issue['frequency'] / sum(i['frequency'] for i in result), 3) if result else 0,
+                    "mentions": issue['frequency'],
+                    "severity": issue['avg_negativity'],
+                    "influence": issue['avg_influence'],
+                    "trend_7d": "stable"
+                },
+                "evidence": [
+                    {
+                        "title": post["title"],
+                        "url": post["url"],
+                        "engagement": {
+                            "upvotes": post["score"],
+                            "comments": post["comments"],
+                            "influence": post["influence"]
+                        }
+                    } for post in issue['sample_posts'][:3]
+                ]
             })
         
         response = {
             "data": {
-                "ranked_companies": ranked_companies
+                "ranked_complaints": ranked_complaints
             },
             "meta": {
-                "total": len(ranked_companies),
+                "total": len(ranked_complaints),
                 "generated_at": datetime.now(timezone.utc).isoformat(),
-                "time_range_days": days,
-                "posts_per_subreddit": limit
+                "time_filter": time_filter,
+                "posts_per_search": limit
             }
         }
         
-        print(f"Analysis complete. Found {len(ranked_companies)} companies")
+        print(f"Analysis complete. Returning {len(ranked_complaints)} issues")
         
         return jsonify(response)
         
@@ -295,9 +357,8 @@ def analyze():
         return jsonify({
             "error": "Analysis failed",
             "message": str(e),
-            "tip": "Try reducing the 'limit' parameter (e.g., ?limit=20)"
+            "tip": "Try reducing the 'limit' parameter"
         }), 500
-
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
