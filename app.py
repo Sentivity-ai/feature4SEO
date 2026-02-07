@@ -4,13 +4,17 @@ import praw
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
-from transformers import pipeline
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 import re
 import os
 import warnings
 warnings.filterwarnings('ignore')
+
+# NLTK for sentiment (lighter than transformers)
+import nltk
+nltk.download('vader_lexicon', quiet=True)
+from nltk.sentiment import SentimentIntensityAnalyzer
 
 app = Flask(__name__)
 CORS(app)
@@ -32,11 +36,8 @@ sentiment_analyzer = None
 def get_sentiment_analyzer():
     global sentiment_analyzer
     if sentiment_analyzer is None:
-        print("Loading sentiment analyzer...")
-        sentiment_analyzer = pipeline(
-            "sentiment-analysis",
-            model="distilbert-base-uncased-finetuned-sst-2-english"
-        )
+        print("Loading sentiment analyzer (NLTK VADER)...")
+        sentiment_analyzer = SentimentIntensityAnalyzer()
         print("Sentiment analyzer loaded")
     return sentiment_analyzer
 
@@ -137,14 +138,17 @@ def collect_reddit_posts(subreddits, search_terms, time_filter='week', limit=20)
     return df
 
 def get_negativity_score(text, analyzer):
+    """
+    Calculate negativity using NLTK VADER sentiment analyzer.
+    Returns score from 0 (positive) to 1 (negative).
+    """
     try:
         text = text[:512]
-        result = analyzer(text)[0]
-        
-        if result['label'] == 'NEGATIVE':
-            return result['score']
-        else:
-            return 1 - result['score']
+        scores = analyzer.polarity_scores(text)
+        # VADER compound score ranges from -1 (negative) to +1 (positive)
+        # We want negativity, so invert and normalize
+        negativity = max(0.0, -scores['compound'])
+        return negativity
     except:
         return 0.5
 
@@ -284,7 +288,8 @@ def home():
             "/": "API info",
             "/health": "Health check",
             "/analyze": "Run issue analysis"
-        }
+        },
+        "note": "Using NLTK VADER for sentiment analysis (lighter, faster)"
     })
 
 @app.route('/health')
@@ -342,7 +347,8 @@ def analyze():
                 "total": len(ranked_complaints),
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "time_filter": time_filter,
-                "posts_per_search": limit
+                "posts_per_search": limit,
+                "sentiment_model": "NLTK VADER"
             }
         }
         
