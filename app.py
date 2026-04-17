@@ -16,8 +16,14 @@ import nltk
 nltk.download('vader_lexicon', quiet=True)
 from nltk.sentiment import SentimentIntensityAnalyzer
 
+# OpenAI for entity extraction
+from openai import OpenAI
+
 app = Flask(__name__)
 CORS(app)
+
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 REDDIT_CLIENT_ID = os.getenv('REDDIT_CLIENT_ID', 'PH99oWZjM43GimMtYigFvA')
 REDDIT_CLIENT_SECRET = os.getenv('REDDIT_CLIENT_SECRET', '3tJsXQKEtFFYInxzLEDqRZ0s_w5z0g')
@@ -182,6 +188,64 @@ def categorize_cluster(keywords_list):
     
     return categories or ['General Marketing']
 
+def extract_complaint_with_openai(sample_titles, tfidf_keywords, category):
+    """
+    Use OpenAI to generate a meaningful complaint title and subcategories
+    from a cluster of post titles and TF-IDF keywords.
+    Falls back to formatted keywords if OpenAI is unavailable.
+    """
+    if not openai_client:
+        # Fallback: clean up keywords a bit (remove obvious stop words)
+        stop = {'just', 'like', 'im', 'get', 'use', 'also', 'one', 'way', 'really', 've'}
+        cleaned = [k for k in tfidf_keywords if k not in stop]
+        return {
+            "title": ', '.join(cleaned[:3]) if cleaned else ', '.join(tfidf_keywords[:3]),
+            "subcategories": cleaned[:5] if cleaned else tfidf_keywords[:5]
+        }
+
+    try:
+        titles_text = '\n'.join(f'- {t}' for t in sample_titles[:8])
+        keywords_text = ', '.join(tfidf_keywords)
+
+        prompt = f"""You are analyzing social media complaints about social listening / SEO / marketing tools.
+
+Here are some Reddit post titles from a cluster of related complaints:
+{titles_text}
+
+TF-IDF keywords from this cluster: {keywords_text}
+Detected category: {category}
+
+Your job:
+1. Write a short, plain-English complaint title (5-8 words max) that describes what users are actually complaining about. No jargon, no "+"s, no raw keywords. Make it sound like a real issue a product manager would care about.
+2. List 3-5 specific subcategory tags (single words or short phrases) that describe the complaint themes.
+
+Respond ONLY in this JSON format with no extra text:
+{{"title": "...", "subcategories": ["...", "...", "..."]}}"""
+
+        response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=120,
+            temperature=0.3
+        )
+
+        import json
+        content = response.choices[0].message.content.strip()
+        parsed = json.loads(content)
+        return {
+            "title": parsed.get("title", tfidf_keywords[0]),
+            "subcategories": parsed.get("subcategories", tfidf_keywords[:5])
+        }
+    except Exception as e:
+        print(f"OpenAI extraction failed: {e}, falling back to keywords")
+        stop = {'just', 'like', 'im', 'get', 'use', 'also', 'one', 'way', 'really', 've'}
+        cleaned = [k for k in tfidf_keywords if k not in stop]
+        return {
+            "title": ', '.join(cleaned[:3]) if cleaned else ', '.join(tfidf_keywords[:3]),
+            "subcategories": cleaned[:5] if cleaned else tfidf_keywords[:5]
+        }
+
+
 def analyze_issues(time_filter='week', limit=15, num_clusters=8):
     """
     Main analysis pipeline - updated with influence algorithm.
@@ -259,10 +323,13 @@ def analyze_issues(time_filter='week', limit=15, num_clusters=8):
                 "influence": round(float(post['influence']), 2)
             })
         
+        sample_titles = cluster_posts['title'].tolist()[:10]
+
         ranked_issues.append({
             'cluster_id': cluster_id,
             'categories': categories,
             'keywords': keywords,
+            'sample_titles': sample_titles,
             'frequency': frequency,
             'avg_negativity': round(avg_negativity, 3),
             'avg_influence': round(avg_influence, 2),
@@ -362,13 +429,19 @@ def analyze():
         
         ranked_complaints = []
         for issue in result:
+            category = issue['categories'][0] if issue['categories'] else 'General Marketing'
+            extracted = extract_complaint_with_openai(
+                issue.get('sample_titles', []),
+                issue['keywords'],
+                category
+            )
             ranked_complaints.append({
                 "rank": issue['rank'],
                 "complaint": {
                     "id": f"issue_{issue['cluster_id']}",
-                    "title": ' + '.join(issue['keywords'][:3]),
-                    "category": issue['categories'][0] if issue['categories'] else 'General',
-                    "subcategories": issue['keywords']
+                    "title": extracted["title"],
+                    "category": category,
+                    "subcategories": extracted["subcategories"]
                 },
                 "metrics": {
                     "frequency": round(issue['frequency'] / sum(i['frequency'] for i in result), 3) if result else 0,
